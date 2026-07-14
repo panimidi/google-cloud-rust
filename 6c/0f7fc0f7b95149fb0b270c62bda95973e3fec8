@@ -1,0 +1,20 @@
+src/pubsub/src/publisher/actor.rs
+  s_c3c813de385d90::t_f2118974cd3684 116-118
+  s_c3c813de385d90::t_522853466eb032 245-249,261-270,275-277,283,370-374,415-425,433-435,440
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "6c0f7fc0f7b95149fb0b270c62bda95973e3fec8",
+  "prompts": {},
+  "sessions": {
+    "s_c3c813de385d90": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "566dd005-a172-40f9-a949-871f75c9ff68",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Pablo Milan <pablo.milan@mercadolibre.com>"
+    }
+  }
+}
