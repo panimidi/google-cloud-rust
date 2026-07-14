@@ -31,7 +31,7 @@ pub(crate) enum ToDispatcher {
 }
 
 /// A command sent from the Dispatcher to a batch actor.
-enum ToBatchActor {
+pub(crate) enum ToBatchActor {
     /// A request to publish a single message.
     Publish(BundledMessage),
     /// A request to flush all outstanding messages.
@@ -57,6 +57,10 @@ pub(crate) struct Dispatcher {
     client: GapicPublisher,
     batching_options: BatchingOptions,
     rx: mpsc::UnboundedReceiver<ToDispatcher>,
+    /// Pre-seeded handle for the default ("") actor when Publisher bypasses the
+    /// Dispatcher for empty ordering-key messages. The Dispatcher still owns this
+    /// handle so it can include the actor in timer-driven flushes.
+    default_actor: Option<BatchActorHandle>,
 }
 
 impl Dispatcher {
@@ -71,6 +75,28 @@ impl Dispatcher {
             client,
             rx,
             batching_options,
+            default_actor: None,
+        }
+    }
+
+    /// Creates a Dispatcher with a pre-seeded default ("") batch actor.
+    ///
+    /// Used when the `Publisher` holds a direct sender to the default actor so
+    /// that empty ordering-key messages bypass this Dispatcher entirely. The
+    /// Dispatcher still needs the handle to include the actor in timer flushes.
+    pub(crate) fn new_with_default_actor(
+        topic_name: String,
+        client: GapicPublisher,
+        batching_options: BatchingOptions,
+        rx: mpsc::UnboundedReceiver<ToDispatcher>,
+        default_actor: BatchActorHandle,
+    ) -> Self {
+        Self {
+            topic_name,
+            client,
+            rx,
+            batching_options,
+            default_actor: Some(default_actor),
         }
     }
 
@@ -122,28 +148,21 @@ impl Dispatcher {
         // Publish without ordering keys are treated as having the key "".
         let mut batch_actors: HashMap<String, BatchActorHandle> = HashMap::new();
         let mut actor_tasks: JoinMap<String, ()> = JoinMap::new();
-        let delay = self.batching_options.delay_threshold;
-        let timer = tokio::time::sleep(delay);
-        // Pin the timer to the stack.
-        tokio::pin!(timer);
+
+        // Seed with the pre-created default ("") actor if provided (for fast-path
+        // bypass compatibility and Publisher::flush() correctness). Batch actors
+        // now own their own lazy flush timers, so the Dispatcher is a pure router
+        // with no timer responsibility of its own.
+        if let Some(handle) = self.default_actor.take() {
+            batch_actors.insert("".to_string(), handle);
+        }
+
         loop {
             tokio::select! {
                 _ = actor_tasks.join_next(), if !actor_tasks.is_empty() => {
                     // TODO(#4012): Remove batch actors when there are no outstanding operations
                     // on the ordering key.
                     continue;
-                }
-                // Currently, the Dispatcher periodically flushes all batches on a shared timer.
-                // If needed, this can be moved into the batch actors such that each are running
-                // on a separate timer.
-                _ = &mut timer => {
-                    for (_, batch_actor) in batch_actors.iter() {
-                        let (tx, _) = oneshot::channel();
-                        if batch_actor.sender.send(ToBatchActor::Flush(tx)).is_err() {
-                            return; // Stop the dispatcher if a batch actor is dropped.
-                        }
-                    }
-                    timer.as_mut().reset(tokio::time::Instant::now() + delay);
                 }
                 // Handle receiving a message from the channel.
                 msg = self.rx.recv() => {
@@ -167,15 +186,12 @@ impl Dispatcher {
                                 flush_set.spawn(rx);
                             }
                             tokio::spawn(async move {
-                                // Wait on all the flush operations.
                                 flush_set.join_all().await;
                                 let _ = tx.send(());
                             });
                         },
                         Some(ToDispatcher::ResumePublish(ordering_key)) => {
                             if let Some(batch_actor) = batch_actors.get_mut(&ordering_key) {
-                                // Send down the same tx for the BatchActors to directly signal completion
-                                // instead of spawning a new task.
                                 if batch_actor.sender.send(ToBatchActor::ResumePublish()).is_err() {
                                     return; // Stop the dispatcher if a batch actor is dropped.
                                 }
@@ -183,27 +199,20 @@ impl Dispatcher {
                         }
                         None => {
                             // Gracefully shutdown since the Publisher has dropped the Sender.
-                            // By dropping the BatchActorHandles, they will individually handle the
-                            // shutdown procedures.
                             drop(batch_actors);
-                            // When we drop actor_tasks, some batch actors may not have started execution
-                            // so the batch actor is aborted with messages in its receiving channel.
-                            // We wait for the batch actors instead of aborting so that it can
-                            // gracefully shutdown.
                             while actor_tasks.join_next().await.is_some() {};
                             break;
                         }
                     }
                 }
-
             }
         }
     }
 }
 
 #[derive(Debug)]
-struct BatchActorHandle {
-    sender: mpsc::UnboundedSender<ToBatchActor>,
+pub(crate) struct BatchActorHandle {
+    pub(crate) sender: mpsc::UnboundedSender<ToBatchActor>,
 }
 
 #[derive(Debug)]
@@ -232,12 +241,12 @@ impl BatchActorContext {
 
 /// A batch actor that sends batches concurrently.
 #[derive(Debug)]
-struct ConcurrentBatchActor {
+pub(crate) struct ConcurrentBatchActor {
     context: BatchActorContext,
 }
 
 impl ConcurrentBatchActor {
-    fn new(
+    pub(crate) fn new(
         topic: String,
         client: GapicPublisher,
         batching_options: BatchingOptions,
@@ -263,8 +272,13 @@ impl ConcurrentBatchActor {
     ///
     /// The loop terminates when the `rx` channel is closed, which happens when the
     /// Dispatcher drops the Sender.
-    async fn run(mut self) {
+    pub(crate) async fn run(mut self) {
         // We have multiple inflight batches concurrently.
+        let delay = self.context.batching_options.delay_threshold;
+        // Lazy timer: armed on the first message, disarmed after a flush that
+        // leaves the batch empty. An idle actor blocks in recv() with no time-
+        // wheel entry — zero scheduler overhead at rest.
+        let mut timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
         let mut inflight = JoinSet::new();
         let mut batch = Batch::new(
             self.context.topic.len() as u32,
@@ -276,23 +290,35 @@ impl ConcurrentBatchActor {
                 _ = inflight.join_next(), if !inflight.is_empty() => {
                     continue;
                 }
+                // Flush on timer — only active when messages are pending.
+                _ = async { timer.as_mut().unwrap().await }, if timer.is_some() => {
+                    self.flush(&mut inflight, &mut batch);
+                    if batch.is_empty() && inflight.is_empty() {
+                        timer = None;
+                    } else {
+                        timer.as_mut().unwrap().as_mut()
+                            .reset(tokio::time::Instant::now() + delay);
+                    }
+                }
                 msg = self.context.rx.recv() => {
                     match msg {
                         Some(ToBatchActor::Publish(msg)) => {
                             self.add_msg_and_flush(&mut inflight, &mut batch, msg);
+                            if timer.is_none() {
+                                timer = Some(Box::pin(tokio::time::sleep(delay)));
+                            }
                         },
                         Some(ToBatchActor::Flush(tx)) => {
                             self.flush(&mut inflight, &mut batch);
                             inflight.join_all().await;
                             inflight = JoinSet::new();
+                            timer = None;
                             let _ = tx.send(());
                         },
                         Some(ToBatchActor::ResumePublish()) => {
                             // Nothing to resume as we do not pause without ordering key.
                         }
                         None => {
-                            // This isn't guaranteed to execute if a user does not .await on the
-                            // corresponding PublishFutures.
                             self.flush(&mut inflight, &mut batch);
                             inflight.join_all().await;
                             break;
@@ -373,6 +399,11 @@ impl SequentialBatchActor {
     /// The loop terminates when the `rx` channel is closed, which happens when the
     /// Dispatcher drops the Sender.
     async fn run(mut self) {
+        let delay = self.context.batching_options.delay_threshold;
+        // Lazy timer: same pattern as ConcurrentBatchActor — armed when the
+        // first message arrives in a new batch cycle, disarmed after a flush
+        // that drains all pending messages.
+        let mut timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
         // While it is possible to use Some(JoinHandle) here as there is at max
         // a single inflight task at any given time, the use of JoinSet
         // simplify the managing the inflight JoinHandle.
@@ -413,6 +444,17 @@ impl SequentialBatchActor {
                     self.handle_inflight_join(join);
                     self.move_to_batch_and_flush(&mut inflight, &mut batch);
                 }
+                // Flush on timer — only active when messages are pending.
+                _ = async { timer.as_mut().unwrap().await }, if timer.is_some() => {
+                    self.flush(&mut inflight, &mut batch).await;
+                    inflight = JoinSet::new();
+                    if self.pending_msgs.is_empty() && batch.is_empty() {
+                        timer = None;
+                    } else {
+                        timer.as_mut().unwrap().as_mut()
+                            .reset(tokio::time::Instant::now() + delay);
+                    }
+                }
                 msg = self.context.rx.recv() => {
                     match msg {
                         Some(ToBatchActor::Publish(msg)) => {
@@ -420,18 +462,20 @@ impl SequentialBatchActor {
                             if inflight.is_empty() {
                                 self.move_to_batch_and_flush(&mut inflight, &mut batch);
                             }
+                            if timer.is_none() {
+                                timer = Some(Box::pin(tokio::time::sleep(delay)));
+                            }
                         },
                         Some(ToBatchActor::Flush(tx)) => {
                             self.flush(&mut inflight, &mut batch).await;
                             inflight = JoinSet::new();
+                            timer = None;
                             let _ = tx.send(());
                         },
                         Some(ToBatchActor::ResumePublish()) => {
                             // Nothing to resume as we are not paused.
                         },
                         None => {
-                            // This isn't guaranteed to execute if a user does not .await on the
-                            // corresponding PublishFutures.
                             self.flush(&mut inflight, &mut batch).await;
                             break;
                         }

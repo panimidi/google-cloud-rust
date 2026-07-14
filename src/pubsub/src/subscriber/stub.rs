@@ -15,6 +15,7 @@
 use crate::Result;
 use crate::google::pubsub::v1::{StreamingPullRequest, StreamingPullResponse};
 use gaxi::grpc::tonic::{Response as TonicResponse, Result as TonicResult};
+use std::future::Future;
 use tokio::sync::mpsc::Receiver;
 
 pub(super) trait TonicStreaming: std::fmt::Debug + Send + 'static {

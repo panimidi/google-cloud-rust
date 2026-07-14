@@ -14,6 +14,7 @@
 
 use super::options::BatchingOptions;
 use crate::publisher::actor::BundledMessage;
+use crate::publisher::actor::ToBatchActor;
 use crate::publisher::actor::ToDispatcher;
 use crate::publisher::builder::PublisherBuilder;
 
@@ -70,6 +71,10 @@ pub struct Publisher {
     #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) batching_options: BatchingOptions,
     pub(crate) tx: UnboundedSender<ToDispatcher>,
+    /// Direct sender to the default ("") `ConcurrentBatchActor`, bypassing the
+    /// Dispatcher for the common case of messages without an ordering key.
+    /// This eliminates one mpsc hop and one task wakeup per published message.
+    pub(crate) direct_tx: UnboundedSender<ToBatchActor>,
 }
 
 impl Publisher {
@@ -104,16 +109,19 @@ impl Publisher {
     #[must_use = "ignoring the publish result may lead to undetected delivery failures"]
     pub fn publish(&self, msg: crate::model::Message) -> crate::publisher::PublishFuture {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let bundled = BundledMessage { msg, tx };
 
-        // If this fails, the Dispatcher is gone, which indicates it has been dropped,
-        // possibly due to the background task being stopped by the runtime.
-        // The PublishFuture will automatically receive an error when `tx` is dropped.
-        if self
-            .tx
-            .send(ToDispatcher::Publish(BundledMessage { msg, tx }))
-            .is_err()
-        {
-            // `tx` is dropped here if the send errors.
+        if bundled.msg.ordering_key.is_empty() {
+            // Fast path: send directly to the default ("") batch actor, bypassing
+            // the Dispatcher. Eliminates one mpsc hop and one task wakeup per message
+            // for the common case where no ordering key is needed.
+            // If this fails, the actor is gone — `tx` is dropped and PublishFuture
+            // resolves with an error automatically.
+            let _ = self.direct_tx.send(ToBatchActor::Publish(bundled));
+        } else {
+            // Ordering key present: route through Dispatcher so it can assign the
+            // message to the correct SequentialBatchActor for that key.
+            let _ = self.tx.send(ToDispatcher::Publish(bundled));
         }
         crate::publisher::PublishFuture { rx }
     }

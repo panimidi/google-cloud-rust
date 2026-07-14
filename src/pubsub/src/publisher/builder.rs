@@ -15,7 +15,7 @@ use super::constants::*;
 use super::options::BatchingOptions;
 use crate::client::Publisher;
 use crate::generated::gapic_dataplane::client::Publisher as GapicPublisher;
-use crate::publisher::actor::Dispatcher;
+use crate::publisher::actor::{BatchActorHandle, ConcurrentBatchActor, Dispatcher};
 use crate::publisher::base_publisher::BasePublisher;
 use google_cloud_gax::{
     backoff_policy::BackoffPolicyArg, retry_policy::RetryPolicyArg,
@@ -396,18 +396,39 @@ impl PublisherPartialBuilder {
             )
             .set_byte_threshold(self.batching_options.byte_threshold.clamp(0, MAX_BYTES));
 
+        // Pre-create the default ("") ConcurrentBatchActor and give Publisher a
+        // direct sender to it. This lets publish() bypass the Dispatcher entirely
+        // for the common case of messages without an ordering key, eliminating one
+        // mpsc hop and one task wakeup per message.
+        let (direct_tx, direct_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(
+            ConcurrentBatchActor::new(
+                self.topic.clone(),
+                self.inner.clone(),
+                batching_options.clone(),
+                direct_rx,
+            )
+            .run(),
+        );
+
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        // Create the Dispatcher that will run in the background.
-        // We don't need to keep track of a handle to the dispatcher.
-        // Dropping the Publisher will drop the only sender to the channel.
-        // This will cause the dispatcher to gracefully exit.
-        let dispatcher = Dispatcher::new(self.topic, self.inner, batching_options.clone(), rx);
+        // Pass a handle to the default actor to the Dispatcher so it can include
+        // the actor in timer-driven flushes even though Publish messages for ""
+        // no longer flow through the Dispatcher.
+        let dispatcher = Dispatcher::new_with_default_actor(
+            self.topic,
+            self.inner,
+            batching_options.clone(),
+            rx,
+            BatchActorHandle { sender: direct_tx.clone() },
+        );
         let handle = tokio::spawn(dispatcher.run());
 
         (
             Publisher {
                 batching_options,
                 tx,
+                direct_tx,
             },
             handle,
         )
