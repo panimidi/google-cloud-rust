@@ -1,0 +1,34 @@
+src/pubsub/src/subscriber/stub.rs
+  s_c3c813de385d90::t_612084787cf513 18
+src/pubsub/src/publisher/builder.rs
+  s_c3c813de385d90::t_612084787cf513 18,399-413,415-424,431
+src/pubsub/src/publisher/actor.rs
+  s_c3c813de385d90::t_612084787cf513 34,60-63,78,82-99,151-159,214-215,244,249,275,277-281,293-302,307-309,315,402-406,447-456,465-467,472
+  s_5677b69e467d77::t_e73fd21138079f 79-81,457
+src/pubsub/src/publisher/client.rs
+  s_c3c813de385d90::t_612084787cf513 17,74-77,112,114-124
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "54ff152747ac31d439a92f3dbb0d9d1204eee3a8",
+  "prompts": {},
+  "sessions": {
+    "s_5677b69e467d77": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee0ae4e6-0f9f-46ff-8a91-14c63a301046",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Pablo Milan <pablo.milan@mercadolibre.com>"
+    },
+    "s_c3c813de385d90": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "566dd005-a172-40f9-a949-871f75c9ff68",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Pablo Milan <pablo.milan@mercadolibre.com>"
+    }
+  }
+}
