@@ -20,6 +20,16 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::task::JoinMap;
 
+/// Deadline for (re-)arming a batch actor's flush timer, `delay` from now.
+/// Saturates instead of overflowing: `delay_threshold` can be set arbitrarily
+/// large (e.g. `Duration::MAX`) to effectively disable the timer, and
+/// `Instant + Duration::MAX` panics, whereas `sleep(Duration::MAX)` does not.
+fn arm_deadline(delay: std::time::Duration) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    now.checked_add(delay)
+        .unwrap_or_else(|| now + std::time::Duration::from_secs(u64::from(u32::MAX)))
+}
+
 /// A command sent from the `Publisher` to the background Dispatcher actor.
 pub(crate) enum ToDispatcher {
     /// A request to publish a single message.
@@ -251,11 +261,18 @@ impl ConcurrentBatchActor {
     /// Dispatcher drops the Sender.
     async fn run(mut self) {
         let delay = self.context.batching_options.delay_threshold;
-        // Lazy timer: armed when the first message enters a batch and dropped
-        // (`None`) when a flush drains the batch. Dropping the timer unregisters
-        // it from Tokio's timer driver, so idle actors hold zero time-wheel
-        // entries and incur zero CPU wakeups at rest.
-        let mut timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+        // Lazy timer (reset variant): a single Sleep is kept for the actor's
+        // lifetime and re-armed with reset(); `armed` guards the select arm so
+        // an idle actor does not poll it. It starts un-polled (armed = false) so
+        // it is not registered with the timer driver until the first arm. On arm
+        // we must reset() the deadline: a disarmed Sleep keeps its old deadline
+        // and may already have fired, which would otherwise flush the next
+        // message immediately. Trade-off vs the drop variant: no per-cycle
+        // allocation, but a disarm leaves the old deadline live, so the actor
+        // takes one spurious wakeup ~delay after going idle (then zero at rest).
+        let sleep = tokio::time::sleep(delay);
+        tokio::pin!(sleep);
+        let mut armed = false;
         // We have multiple inflight batches concurrently.
         let mut inflight = JoinSet::new();
         let mut batch = Batch::new(
@@ -270,32 +287,30 @@ impl ConcurrentBatchActor {
                 }
                 // Flush on timer. flush spawns the batch send into `inflight`
                 // (reaped by the join_next arm above) and drains the batch, so
-                // the timer is dropped afterwards; a later message re-arms it.
-                // The timer is wrapped in an async block so the unwrap runs only
-                // when the branch is polled (i.e. when timer.is_some()); select!
-                // evaluates the branch expression eagerly, so a bare
-                // `timer.as_mut().unwrap()` would unwrap None.
-                _ = async { timer.as_mut().unwrap().await }, if timer.is_some() => {
+                // the timer is disarmed afterwards; a later message re-arms it.
+                _ = &mut sleep, if armed => {
                     self.flush(&mut inflight, &mut batch);
-                    timer = None;
+                    armed = false;
                 }
                 msg = self.context.rx.recv() => {
                     match msg {
                         Some(ToBatchActor::Publish(msg)) => {
                             self.add_msg_and_flush(&mut inflight, &mut batch, msg);
                             // add_msg_and_flush may have flushed on a threshold,
-                            // leaving the batch empty; disarm if so, otherwise arm.
+                            // leaving the batch empty; disarm if so, otherwise arm
+                            // (resetting the deadline for the new batch cycle).
                             if batch.is_empty() {
-                                timer = None;
-                            } else if timer.is_none() {
-                                timer = Some(Box::pin(tokio::time::sleep(delay)));
+                                armed = false;
+                            } else if !armed {
+                                sleep.as_mut().reset(arm_deadline(delay));
+                                armed = true;
                             }
                         },
                         Some(ToBatchActor::Flush(tx)) => {
                             self.flush(&mut inflight, &mut batch);
                             inflight.join_all().await;
                             inflight = JoinSet::new();
-                            timer = None;
+                            armed = false;
                             let _ = tx.send(());
                         },
                         Some(ToBatchActor::ResumePublish()) => {
@@ -385,10 +400,13 @@ impl SequentialBatchActor {
     /// Dispatcher drops the Sender.
     async fn run(mut self) {
         let delay = self.context.batching_options.delay_threshold;
-        // Lazy timer: same pattern as ConcurrentBatchActor — armed when the
-        // first message arrives in a new batch cycle, disarmed after a flush
-        // that drains all pending messages.
-        let mut timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+        // Lazy timer (reset variant): same pattern as ConcurrentBatchActor — a
+        // single Sleep re-armed with reset(), guarded by `armed`, starting
+        // un-polled so it is not registered until the first arm. See that actor
+        // for the reset-on-arm requirement and the idle-wakeup trade-off.
+        let sleep = tokio::time::sleep(delay);
+        tokio::pin!(sleep);
+        let mut armed = false;
         // While it is possible to use Some(JoinHandle) here as there is at max
         // a single inflight task at any given time, the use of JoinSet
         // simplify the managing the inflight JoinHandle.
@@ -430,15 +448,12 @@ impl SequentialBatchActor {
                     self.move_to_batch_and_flush(&mut inflight, &mut batch);
                 }
                 // Flush on timer. flush drains all pending messages, so the
-                // timer is dropped afterwards; a later message re-arms it. This
-                // mirrors the Flush branch below. The timer is wrapped in an
-                // async block so the unwrap runs only when the branch is polled
-                // (i.e. when timer.is_some()); select! evaluates the branch
-                // expression eagerly, so a bare unwrap would unwrap None.
-                _ = async { timer.as_mut().unwrap().await }, if timer.is_some() => {
+                // timer is disarmed afterwards; a later message re-arms it. This
+                // mirrors the Flush branch below.
+                _ = &mut sleep, if armed => {
                     self.flush(&mut inflight, &mut batch).await;
                     inflight = JoinSet::new();
-                    timer = None;
+                    armed = false;
                 }
                 msg = self.context.rx.recv() => {
                     match msg {
@@ -448,17 +463,19 @@ impl SequentialBatchActor {
                                 self.move_to_batch_and_flush(&mut inflight, &mut batch);
                             }
                             // move_to_batch_and_flush may have flushed on a
-                            // threshold, draining everything; disarm if so, else arm.
+                            // threshold, draining everything; disarm if so, else
+                            // arm (resetting the deadline for the new cycle).
                             if self.pending_msgs.is_empty() && batch.is_empty() {
-                                timer = None;
-                            } else if timer.is_none() {
-                                timer = Some(Box::pin(tokio::time::sleep(delay)));
+                                armed = false;
+                            } else if !armed {
+                                sleep.as_mut().reset(arm_deadline(delay));
+                                armed = true;
                             }
                         },
                         Some(ToBatchActor::Flush(tx)) => {
                             self.flush(&mut inflight, &mut batch).await;
                             inflight = JoinSet::new();
-                            timer = None;
+                            armed = false;
                             let _ = tx.send(());
                         },
                         Some(ToBatchActor::ResumePublish()) => {
