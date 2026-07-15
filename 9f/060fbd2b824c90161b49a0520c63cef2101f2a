@@ -1,0 +1,24 @@
+src/pubsub/src/publisher/actor.rs
+  s_c3c813de385d90::t_46b568ffbfa154 451-453,456,466-467,469-470,472,478
+  s_c3c813de385d90::t_2ca0404ecc3952 23-32
+  s_c3c813de385d90::t_7f520bb4a3f9c1 305,471
+  s_c3c813de385d90::t_2e8ef1ae11cc83 264-275
+  s_c3c813de385d90::t_5c5a4f23fedf26 290-291,293,300-301,303-304,306,313
+  s_c3c813de385d90::t_02593d6aa71d72 403-409
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "9f060fbd2b824c90161b49a0520c63cef2101f2a",
+  "prompts": {},
+  "sessions": {
+    "s_c3c813de385d90": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "566dd005-a172-40f9-a949-871f75c9ff68",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "panimidi <panimidi@hotmail.com>"
+    }
+  }
+}
