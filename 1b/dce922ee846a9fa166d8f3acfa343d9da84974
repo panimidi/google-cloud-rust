@@ -1,0 +1,29 @@
+src/pubsub/src/publisher/actor.rs
+  s_c3c813de385d90::t_ea7f0f995ae251 432-433,441,450-454
+  s_c3c813de385d90::t_0ec42b24716421 117
+  s_c3c813de385d90::t_afdc3db772e578 434-437
+  s_c3c813de385d90::t_f442620b54e590 305-306
+  s_c3c813de385d90::t_359c70a833ad94 468-469
+  s_c3c813de385d90::t_f195902a5163c4 280,286-290
+  s_c3c813de385d90::t_88faf2126c781c 163-164
+  s_c3c813de385d90::t_25f0a3713778a0 254-257,259
+  s_c3c813de385d90::t_0efecae96484b5 271-277
+  s_c3c813de385d90::t_665185be96233c 172-173,175-178,184
+  s_c3c813de385d90::t_647b885a416dda 156
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "1bdce922ee846a9fa166d8f3acfa343d9da84974",
+  "prompts": {},
+  "sessions": {
+    "s_c3c813de385d90": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "566dd005-a172-40f9-a949-871f75c9ff68",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "panimidi <panimidi@hotmail.com>"
+    }
+  }
+}
